@@ -14,6 +14,7 @@
 
 extern crate std;
 
+use crate::malicious_token::{Attack, MaliciousToken, MaliciousTokenClient};
 use crate::{
     ContractError, Escrow, EscrowClient, EscrowState, Payee, MAX_BASKET_SIZE, MAX_SHIPPING_WINDOW,
 };
@@ -1334,6 +1335,23 @@ fn create_basket_escrow_validates_shipping_window() {
     );
 }
 
+// ── Issue #1221 – atomic inflow verification in fund_basket_escrow ──────────
+
+/// A fee-on-transfer token reports a successful `transfer` while crediting
+/// less than the pledged amount. `fund_basket_escrow` must detect the
+/// shortfall with its post-transfer balance check and abort the whole
+/// invocation, rolling back the transfers that already succeeded.
+#[test]
+fn fund_basket_escrow_rejects_fee_on_transfer_token_and_rolls_back() {
+    let fx = setup();
+    let client = EscrowClient::new(&fx.env, &fx.contract_id);
+    let primary = make_token(&fx.env);
+    let malicious = fx.env.register(MaliciousToken, ());
+    let mclient = MaliciousTokenClient::new(&fx.env, &malicious);
+
+    let primary_amount = 1_000_i128;
+    let malicious_amount = 500_i128;
+
 // ── Issue #1220 – token allowlist gating for every basket token ─────────────
 
 /// When the token allowlist is enabled, every token in the basket — not just
@@ -1519,6 +1537,21 @@ fn refund_paths_return_gross_basket_tokens_without_fees() {
         &None::<u64>,
         &0_u64,
     );
+
+    primary.admin.mint(&fx.buyer, &primary_amount);
+    mclient.mint(&fx.buyer, &malicious_amount);
+    mclient.set_attack(&Attack::FeeOnTransfer);
+
+    let result = client.try_fund_basket_escrow(&escrow_id, &fx.buyer);
+    assert_eq!(result, Err(Ok(ContractError::InsufficientBalance)));
+
+    // Atomic revert: even the primary token transfer that already succeeded is
+    // rolled back when the secondary token under-funds the contract.
+    assert_eq!(primary.token.balance(&fx.buyer), primary_amount);
+    assert_eq!(primary.token.balance(&fx.contract_id), 0);
+    assert_eq!(mclient.balance(&fx.buyer), malicious_amount);
+    assert_eq!(mclient.balance(&fx.contract_id), 0);
+    assert_eq!(client.get_escrow(&escrow_id).state, EscrowState::Pending);
     assert_eq!(client.get_basket_tokens(&escrow_id).unwrap().len(), 2);
     a.admin.mint(&fx.buyer, &a_amount);
     b.admin.mint(&fx.buyer, &b_amount);
